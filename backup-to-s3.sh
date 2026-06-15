@@ -6,6 +6,10 @@
 #   ./backup-to-s3.sh
 #   Or with overrides:
 #   BUCKET=my-bucket PREFIX=backups/laptop ./backup-to-s3.sh
+#
+# Custom exclusions:
+#   Add patterns to ~/.backup-excludes (one per line, # for comments).
+#   Patterns follow aws s3 sync glob syntax — see EXCLUDE FILE section below.
 
 set -euo pipefail
 
@@ -17,8 +21,10 @@ BUCKET="${BUCKET:-}"                    # e.g. my-backup-bucket
 PREFIX="${PREFIX:-}"                    # e.g. backups/mymachine  (no trailing slash)
 AWS_PROFILE="${AWS_PROFILE:-default}"   # AWS CLI profile name
 
+# Path to your custom exclusions file. Override with EXCLUDE_FILE env var.
+EXCLUDE_FILE="${EXCLUDE_FILE:-$HOME/.backup-excludes}"
+
 # Windows paths to back up (accessed via /mnt/<drive>)
-# Add or remove entries as needed.
 WINDOWS_SOURCES=(
     # "/mnt/d"                          # entire D: drive
     # "/mnt/d/Documents"
@@ -31,22 +37,107 @@ WSL_SOURCES=(
     # "/home/youruser/projects"
 )
 
-# Patterns to exclude (passed to aws s3 sync --exclude)
-EXCLUDES=(
-    "*.tmp"
-    "*.log"
-    "Thumbs.db"
-    ".DS_Store"
+# ---------------------------------------------------------------------------
+# BUILT-IN EXCLUSIONS
+# These are always applied. Add your own in ~/.backup-excludes instead of
+# editing here, so script updates don't overwrite your customisations.
+# ---------------------------------------------------------------------------
+
+BUILTIN_EXCLUDES=(
+    # Windows system noise
     "pagefile.sys"
     "hiberfil.sys"
     "swapfile.sys"
     "\$Recycle.Bin/*"
     "System Volume Information/*"
     "Windows/*"
+    "Thumbs.db"
+    "desktop.ini"
+
+    # macOS noise (if backing up drives that were ever used on a Mac)
+    ".DS_Store"
+    "._*"
+    ".Spotlight-V100/*"
+    ".Trashes/*"
+
+    # Temp / junk
+    "*.tmp"
+    "*.temp"
+    "~$*"                   # Office temp files
+    "*.bak"
+    "*.swp"
+    "*.swo"
+
+    # Logs (comment out if you DO want logs backed up)
+    "*.log"
+    "*.log.*"
+
+    # Node / JS
     "*/node_modules/*"
-    "*/.git/objects/*"
+    "*/.npm/*"
+    "*/.yarn/cache/*"
+    "*/.pnp.*"
+    "*/dist/*"
+    "*/build/*"
+    "*/.next/*"
+    "*/.nuxt/*"
+    "*/.svelte-kit/*"
+    "*/.turbo/*"
+    "*/.parcel-cache/*"
+
+    # Python
     "*/__pycache__/*"
+    "*/.mypy_cache/*"
+    "*/.ruff_cache/*"
+    "*/.pytest_cache/*"
     "*.pyc"
+    "*.pyo"
+    "*/.venv/*"
+    "*/venv/*"
+    "*/env/*"
+    "*.egg-info/*"
+
+    # Rust
+    "*/target/debug/*"
+    "*/target/release/*"
+
+    # Go
+    "*/vendor/*"
+
+    # Java / JVM
+    "*/target/classes/*"
+    "*/target/generated-sources/*"
+    "*.class"
+    "*.jar"
+    "*.war"
+    "*/.gradle/*"
+    "*/.m2/*"
+
+    # .NET
+    "*/bin/Debug/*"
+    "*/bin/Release/*"
+    "*/obj/Debug/*"
+    "*/obj/Release/*"
+
+    # Git internals (keep .git/config etc., skip the bulk)
+    "*/.git/objects/*"
+    "*/.git/lfs/*"
+
+    # IDE / editor artifacts
+    "*/.idea/*"
+    "*/.vscode/*"
+    "*/.vs/*"
+    "*.iml"
+
+    # Docker
+    # (Docker's data root is usually outside user dirs, but just in case)
+    "*/docker/volumes/*"
+
+    # Large media / compiled assets you likely don't need versioned
+    "*.iso"
+    "*.vmdk"
+    "*.vhd"
+    "*.vhdx"
 )
 
 # ---------------------------------------------------------------------------
@@ -65,7 +156,7 @@ if [[ ${#WINDOWS_SOURCES[@]} -eq 0 && ${#WSL_SOURCES[@]} -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# HELPERS
+# LOGGING
 # ---------------------------------------------------------------------------
 
 LOGFILE="${LOGFILE:-$HOME/.backup-to-s3.log}"
@@ -83,13 +174,45 @@ log() {
     echo "[$ts] $*" | tee -a "$LOGFILE"
 }
 
+# ---------------------------------------------------------------------------
+# EXCLUSION HANDLING
+# ---------------------------------------------------------------------------
+
+# Load patterns from the user's exclude file (skip blank lines and # comments)
+load_user_excludes() {
+    local patterns=()
+    if [[ -f "$EXCLUDE_FILE" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Strip leading/trailing whitespace
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            # Skip empty lines and comments
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            patterns+=("$line")
+        done < "$EXCLUDE_FILE"
+        log "INFO  Loaded $(( ${#patterns[@]} )) custom exclusion(s) from $EXCLUDE_FILE"
+    fi
+    printf '%s\n' "${patterns[@]}"
+}
+
 build_exclude_args() {
     local args=()
-    for pat in "${EXCLUDES[@]}"; do
+
+    for pat in "${BUILTIN_EXCLUDES[@]}"; do
         args+=(--exclude "$pat")
     done
-    echo "${args[@]}"
+
+    # Append user exclusions from file
+    while IFS= read -r pat; do
+        [[ -n "$pat" ]] && args+=(--exclude "$pat")
+    done < <(load_user_excludes)
+
+    printf '%s\0' "${args[@]}"
 }
+
+# ---------------------------------------------------------------------------
+# SYNC
+# ---------------------------------------------------------------------------
 
 sync_path() {
     local src="$1"
@@ -103,15 +226,17 @@ sync_path() {
 
     log "START [$label] $src  →  s3://$s3_dest"
 
-    local exclude_args
-    exclude_args=$(build_exclude_args)
+    # Build exclude args into a temp array via NUL-delimited output
+    local -a exclude_args=()
+    while IFS= read -r -d '' arg; do
+        exclude_args+=("$arg")
+    done < <(build_exclude_args)
 
-    # shellcheck disable=SC2086
     if AWS_PROFILE="$AWS_PROFILE" aws s3 sync \
             "$src" "s3://$s3_dest" \
             --storage-class STANDARD_IA \
             --no-progress \
-            $exclude_args \
+            "${exclude_args[@]}" \
             2>&1 | tee -a "$LOGFILE"; then
         log "OK    [$label] completed"
     else
@@ -126,23 +251,19 @@ sync_path() {
 
 rotate_log
 log "======== Backup started (profile=$AWS_PROFILE, bucket=$BUCKET, prefix=$PREFIX) ========"
+[[ -f "$EXCLUDE_FILE" ]] && log "INFO  Using exclude file: $EXCLUDE_FILE" \
+                          || log "INFO  No exclude file at $EXCLUDE_FILE (create one to add custom patterns)"
 
 FAILED_SOURCES=()
 
 for src in "${WINDOWS_SOURCES[@]}"; do
-    # Derive a clean S3 sub-prefix from the path.
-    # /mnt/d/Documents  → windows/d/Documents
-    # /mnt/d            → windows/d
     rel="${src#/mnt/}"
-    dest="$BUCKET/$PREFIX/windows/$rel"
-    sync_path "$src" "$dest" "win:$rel"
+    sync_path "$src" "$BUCKET/$PREFIX/windows/$rel" "win:$rel"
 done
 
 for src in "${WSL_SOURCES[@]}"; do
-    # /home/user/projects → wsl/home/user/projects
     rel="${src#/}"
-    dest="$BUCKET/$PREFIX/wsl/$rel"
-    sync_path "$src" "$dest" "wsl:$rel"
+    sync_path "$src" "$BUCKET/$PREFIX/wsl/$rel" "wsl:$rel"
 done
 
 if [[ ${#FAILED_SOURCES[@]} -gt 0 ]]; then

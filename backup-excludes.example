@@ -1,0 +1,49 @@
+# ~/.backup-excludes — custom exclusion patterns for backup-to-s3.sh
+#
+# Copy this file to ~/.backup-excludes and edit to suit your setup.
+# One pattern per line. Blank lines and lines starting with # are ignored.
+#
+# Pattern syntax (aws s3 sync glob rules):
+#   */foo/*        — any directory named "foo" anywhere in the tree
+#   *.ext          — any file with that extension
+#   foo/bar/*      — a specific sub-path relative to the backup source root
+#
+# These are MERGED with the built-in exclusions already in backup-to-s3.sh.
+# You only need to list things not already covered there.
+#
+# Override the path to this file: EXCLUDE_FILE=/path/to/file ./backup-to-s3.sh
+
+# ---------------------------------------------------------------------------
+# Project build output (add the specific dir names your projects use)
+# ---------------------------------------------------------------------------
+# */.cache/*
+# */coverage/*
+# */.turbo/*
+# */storybook-static/*
+# */.docusaurus/*
+
+# ---------------------------------------------------------------------------
+# Game / large media directories
+# ---------------------------------------------------------------------------
+# */Steam/*
+# */EpicGames/*
+# *.pak
+# *.wad
+
+# ---------------------------------------------------------------------------
+# Virtual machine images
+# ---------------------------------------------------------------------------
+# *.vmx
+# *.nvram
+# */Virtual Machines/*
+
+# ---------------------------------------------------------------------------
+# Downloads folder (usually noise)
+# ---------------------------------------------------------------------------
+# Downloads/*
+
+# ---------------------------------------------------------------------------
+# Specific project paths you never want backed up
+# ---------------------------------------------------------------------------
+# */my-big-dataset/*
+# */scratch/*
